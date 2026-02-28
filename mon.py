@@ -437,3 +437,61 @@ class MONMultiConv(nn.Module):
             x.append(self.apply_inverse_conv_transpose(g[i] - xp, i))
         x.reverse()
         return tuple(x)
+
+# minimal, drop-in PyTorch fake-quant modules
+class UniformAffineQuant(nn.Module):
+    def __init__(self, bits=8, per_channel=False, ch_axis=0, learn_amax=False):
+        super().__init__()
+        self.bits, self.per_channel, self.ch_axis = bits, per_channel, ch_axis
+        self.learn_amax = learn_amax
+        self.register_buffer('amax', torch.tensor(0.0))
+        self.register_buffer('ema_decay', torch.tensor(0.95))
+        self._eps = 1e-8
+    def _update_amax(self, x):
+        with torch.no_grad():
+            cur = x.abs().amax(dim=self.ch_axis, keepdim=True) if self.per_channel else x.abs().max()
+            if self.amax.numel()==1 and self.per_channel:  # lazily shape buffer
+                shape = [1]*x.ndim; shape[self.ch_axis] = x.shape[self.ch_axis]
+                self.amax = self.amax.expand(shape).clone()
+            self.amax.mul_(self.ema_decay).add_(cur*(1-self.ema_decay))
+    def forward(self, x):
+        if self.training: self._update_amax(x)
+        amax = self.amax.detach() if not self.learn_amax else self.amax
+        qmax = (2**(self.bits-1)-1)
+        scale = (amax / qmax).clamp(min=self._eps)
+        x_scaled = x/scale
+        x_clipped = x_scaled.clamp(-qmax-1, qmax)
+        x_rounded = (x_clipped.round() - x_clipped).detach() + x_clipped  # STE
+        return x_rounded*scale
+
+
+class QuantisedMON(nn.Module):
+    def __init__(self, base_mon, w_bits=8, a_bits=8,
+                 per_channel_w=True, quantize_iterates=False):
+        super().__init__()
+        self.base = base_mon  # existing module with params S, U, b, beta, nonlinearity sigma, solver cfg
+        self.Qw_S = UniformAffineQuant(w_bits, per_channel=per_channel_w, ch_axis=0)
+        self.Qw_U = UniformAffineQuant(w_bits, per_channel=per_channel_w, ch_axis=0)
+        self.Qw_b = UniformAffineQuant(w_bits, per_channel=False)
+        self.Qa    = UniformAffineQuant(a_bits, per_channel=False)
+        self.quantize_iterates = quantize_iterates
+
+    def F(self, z, x, S_q, U_q, b_q, beta):
+        # construct W_q that preserves strong monotonicity via beta
+        W_q = S_q - S_q.transpose(-1, -2) + beta*torch.eye(S_q.size(-1), device=S_q.device)
+        return (torch.eye(W_q.size(-1), device=z.device) - W_q) @ z - self.base.sigma(U_q @ x + b_q)
+
+    def forward(self, x):
+        S_q = self.Qw_S(self.base.S)
+        U_q = self.Qw_U(self.base.U)
+        b_q = self.Qw_b(self.base.b)
+        beta = self.base.beta  # keep FP32
+        x_in = self.Qa(x)
+        # run chosen solver; quantise iterates if enabled
+        z = self.base.z0(x_in)
+        for _ in range(self.base.max_iter):
+            Fz = self.F(self.Qa(z) if self.quantize_iterates else z, x_in, S_q, U_q, b_q, beta)
+            z_next = z - self.base.step * Fz
+            if (z_next - z).norm(dim=-1).mean() < self.base.tol: break
+            z = z_next
+        return z
